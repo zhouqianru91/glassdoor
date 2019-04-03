@@ -1,0 +1,720 @@
+---
+title: "Glassdoor Job Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+library(wordcloud)
+library(tidytext)
+library(tm)
+library(topicmodels)
+library(SnowballC)
+library(LDAvis)
+library(tidyverse)
+require(scales)
+library(broom)
+library(corpus)
+library(servr)
+```
+
+### Summary
+
+In this project, we searched business analyst positions in San Diego, Los Angeles, San Francisco and Mountain View on Glassdoor and scraped the data from text analysis. Following is a summary of our findings and recommendations. 
+
+1. Soft skills are universal in the job market. While we are investing huge amount of time writing codes and working on assignments, we need to put stress on cultivating our soft skills as well.
+
+2. Employers value experience very much and prefer those with demonstrated history of achieving in certain areas. 
+
+3. Techinical skills are important as well and vary with different functions. We can't possibly learn all tools, so it's very important to set up our career choices early and focus on specific skills.
+
+4. Computer science graduates are still among the most sought after. It might be a good choice to learn more about CS on top of our own curriculums. 
+
+5. People receive higher compensations if they are capable to drive changes and work across functions. Managers and directors relatively have more tools at their disposal to drive changes. 
+
+
+### Import Scraped Data
+
+Previous to this part of the analysis, we scraped job posting data from Glassdoor and saved as csv files. Then we import data from 4 locations and combine them for analysis. 
+
+```{r warning=FALSE, message=FALSE}
+# import data files, merge and remove duplicates
+
+# if city is missing, filling in with the broad region name, i.e, la, sf or mountain view
+la <- read_csv("output_LA.csv")
+la$source <- "Los Angeles"
+
+mountview <- read_csv("MTV_withRating_All.csv")
+mountview$source <- "Mountain View"
+
+sf <- read_csv("SF_withRating_All.csv")
+sf$source <- "San Francisco"
+
+sd <- read_csv("San Diego.csv")
+sd$source <- "San Diego"
+colnames(sd) <- sub("company rating", "com_rating", names(sd))
+
+ca <- rbind(la, mountview, sf, sd)
+ca <- distinct(ca)
+ca <- ca[!ca$industry == "industry",] #remove extra headers
+```
+
+### Data Cleaning
+
+The data is not tidy as in mis-placed columns, missing values, meaningless strings and embeded numbers. We tackled all of the problems before EDA analysis. 
+
+```{r}
+# dealing with wrong columns
+columns <- colnames(ca)
+missing_jobtitle <- filter(ca, is.na(jobtitle))
+colnames(missing_jobtitle) <- columns[c(1,2,3,5,4,6,8,9,7,10)]
+
+ca <- ca %>% 
+  filter(!is.na(jobtitle)) %>% 
+  rbind(missing_jobtitle)
+
+wrong_sal <- ca %>% filter(grepl('\\d', ca$state))
+colnames(wrong_sal) <- columns[c(1,2,3,5,6,7,8,9,4,10)]
+ca <- ca %>% 
+  filter(!grepl('\\d', ca$state)) %>% 
+  rbind(wrong_sal)
+
+wrong_sal2 <- ca %>% filter(grepl("\\w{5,}", est_sal))
+colnames(wrong_sal2) <- columns[c(1,2,3,5,6,7,4,9,8,10)]
+ca <- ca %>% 
+  filter(!grepl("\\w{5,}", est_sal)) %>% 
+  rbind(wrong_sal2)
+
+# broadcasting missing cities with big city area
+ca$city <- ifelse(is.na(ca$city), ca$source, ca$city)
+ca$city <- gsub("CA - San Francisco", "San Francisco", ca$city)
+#summary(is.na(ca))
+
+## String replacement
+ca$industry <- gsub("&amp;", "&", ca$industry)
+ca$jobtitle <- gsub("&amp;", "&", ca$jobtitle)
+ca$jobtitle <- gsub("Sr.", "Senior", ca$jobtitle)
+
+ca$com_size <- ifelse(ca$com_size == "-1" | ca$com_size == "-1-0", NaN, 
+                      ifelse(ca$com_size == "Jan-50", "1-50", 
+                             ifelse(ca$com_size == "10000--1", "10001+", ca$com_size)))
+
+ca$com_size <- factor(ca$com_size, levels = c("1-50", "51-200", "201-500", "501-1000",
+                                              "1001-5000", "5001-10000", "10001+"))
+
+
+#set 10000--1 as "10000 or more"
+ca$est_sal_num <- as.numeric(gsub("\\D+", "", ca$est_sal)) #extract annual income
+
+#summary(ca$est_sal_num) # there's one outlier of 23 as it's hourly income
+
+ca <- ca[-which(ca$est_sal_num == 23),] # remove this row
+ca$jobid <- paste0(rep("Job", nrow(ca)), c(1:nrow(ca))) # for future reference
+
+#saveRDS(ca, "ca_jobs.rds") # for geological coordinates query
+
+```
+
+### Exploratory Data Analysis
+
+This part mainly shows the job posting distributions across different locations, industries and company sizes etc. 
+
+```{r}
+# by industry
+industry_dist <- ca %>% 
+  group_by(industry) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count))
+
+industry_dist %>% 
+  slice(1:20) %>% 
+  ggplot(aes(x = fct_reorder(industry, count), y = count)) + 
+  geom_bar(stat = "identity", fill = "cornflowerblue") +
+  coord_flip() + 
+  labs(title = "Top 20 Industries with Most Analyst Job Postings",
+       x = "Industry", 
+       y = "Job Posting Count")
+```
+
+Computer hardware & software, IT service and outsourcing recruitment companies have the most job postings. 
+
+```{r}
+# by location
+ca %>% 
+  group_by(city) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  slice(1:20) %>% 
+  ggplot(aes(x = fct_reorder(city, count), y = count))+
+  geom_bar(stat = "identity", fill = "cornflowerblue")+ 
+  coord_flip() + 
+  labs(title = "Top 20 Cities with Most Analyst Job Postings", 
+       x = "City", 
+       y = "Job Posting Count")
+```
+
+We populated some missing city values with 4 cities, so it's no surprise that most job postings are located in these regions. Other than that, generally cities at northern california have posted more business analyst positions. 
+
+```{r}
+ca %>% 
+  group_by(com_size) %>% 
+  summarise(count = n()) %>% 
+  ggplot(aes(x = com_size, y = count))+
+  geom_bar(stat = "identity", fill = "cornflowerblue")+ 
+  coord_flip() + 
+  labs(title = "Analyst Job Postings Across Different Company Sizes", 
+       x = "Company Size", 
+       y = "Job Posting Count")
+
+```
+
+One thing to note here is that, the companies with around 51 to 200 employees have almost the same amount of jobs available as those with company size of 1001-5000. It's probably because those companies are in high demand of analysts to make informed decisions for their expansion. 
+
+```{r}
+ca %>% 
+  group_by(company) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  slice(1:20) %>% 
+  ggplot(aes(x = fct_reorder(company, count), y = count))+
+  geom_bar(stat = "identity", fill = "cornflowerblue")+ 
+  coord_flip() + 
+  labs(title = "Top 20 Companies with Most Analyst Job Postings", 
+       x = "Company", 
+       y = "Job Posting Count")
+```
+
+Oracle ranks highest in terms of outstanding job postings, followed by Kforce. This resembles what we found in industry distribution part. 
+
+```{r message = FALSE}
+# by job title
+
+title <- ca %>% 
+  select(jobtitle) %>% 
+  unnest_tokens(word, jobtitle) %>% 
+  filter(word != "analyst")
+
+
+title50freq <- title %>%
+  count(word) %>% 
+  anti_join(stop_words) %>% 
+  top_n(50) 
+wordcloud(title50freq$word, title50freq$n, scale = c(5,0.5), colors = brewer.pal(8, "Set1"))
+
+```
+
+By plotting word cloud for job titles, we can get a glimpse at the analyst types in the employment market. Some outstanding words are data, financial, system and operations. Also, senior analysts are among the most sought-afters. 
+
+```{r warning = FALSE}
+
+# Salary Distribution by city
+plt_sal_hist <- ggplot(data=ca, aes(x=est_sal_num)) +
+  geom_histogram(bins = 25, fill = "cornflowerblue") +
+  facet_wrap(~ source)+
+  scale_x_continuous(labels = comma)
+
+plt_sal_hist
+
+```
+
+No suprising that the average salary is higher in San Francisco and Mountain View than in San Diego and Los Angeles. But is it because of the higher living costs or because of the higher skill demand in northen cities? We'll explore this question later. 
+
+### Corpus Summary
+
+#### Unigram, Bigram and Trigram Analysis
+
+```{r message = FALSE}
+jobtext <- ca %>% 
+  select(jobid, text, source) # separate out for text analysis, keep jobid for reference
+
+jobtext$text <- tolower(jobtext$text)
+jobtext$text <- removeWords(jobtext$text, stopwords("english"))
+jobtext$text <- stripWhitespace(jobtext$text)
+
+# plot top 25 unigrams
+
+resultTidy_Uni <- jobtext %>%
+  unnest_tokens(unigram,text,token="ngrams",n=1)
+
+
+non_info_words <- c("business", "will", "analysis", "including", 
+                    "analyst", "knowledge", "required", "work", 
+                    "ability", "requirements", "working", "skills", 
+                    "data", "team", "teams")
+
+# filter non-informative words
+plt_uni <- filter(resultTidy_Uni, !resultTidy_Uni$unigram %in% non_info_words) %>%
+  count(unigram) %>%
+  top_n(25) 
+
+plt_uni_hist <- ggplot(plt_uni, aes(x=fct_reorder(unigram,n),y=n)) + 
+  geom_bar(stat='identity', fill = "cornflowerblue") + 
+  coord_flip() + theme_bw() +
+  #facet_wrap(~source,scales = 'free',nrow=1) + 
+  labs(title='Top 25 Unigrams',
+       subtitle = 'Stop Words Removed',
+       x='Word',
+       y= 'Count') + theme(legend.position="none")
+
+plt_uni_hist
+
+# plot top 25 bigrams
+resultTidy_Bi <- jobtext %>%
+  unnest_tokens(bigram,text,token="ngrams",n=2)
+
+not_work_related <- c("e g", "ad hoc", "equal opportunity", "sexual orientation", "national origin", "business analyst", 
+                      "gender identity", "opportunity employer", "veteran status", "orientation gender", 
+                      "color religion", "regard race", "race color", "without regard", "u s")
+
+plt_bi <- resultTidy_Bi %>%
+  # filter non-informative words
+  filter(!bigram %in% not_work_related) %>%
+  count(bigram) %>%
+  top_n(25) 
+
+plt_bi_hist <- ggplot(plt_bi, aes(x=fct_reorder(bigram,n),y=n)) + # remove fill = bigram
+  geom_bar(stat='identity', fill = "cornflowerblue") + 
+  coord_flip() + theme_bw()+
+  labs(title='Top 25 Bigrams',
+       subtitle = 'Stop Words Removed', #if all of our analysis stops stop words, then we don't need the subtitle
+       x='Word',
+       y= 'Count') + theme(legend.position="none")
+
+plt_bi_hist
+
+
+
+# plot top 25 trigrams
+resultTidy_Tri <- jobtext %>%
+  unnest_tokens(trigram,text,token="ngrams",n=3)
+
+plt_tri <- resultTidy_Tri %>%
+  # This plot is really messed up with all the equality related words
+  filter(!trigram %in% c("equal opportunity employer", "sexual orientation gender", 
+                         "race color religion", "orientation gender identity", 
+                         "without regard race", "regard race color", 
+                         "employment without regard", "color religion sex", 
+                         "will receive consideration", "qualified applicants will", 
+                         "applicants will receive", "receive consideration employment", 
+                         "consideration employment without", "affirmative action employer", 
+                         "protected veteran status", "sex sexual orientation", 
+                         "equal opportunity affirmative", "opportunity affirmative action", 
+                         "employer qualified applicants", "equal employment opportunity", 
+                         "identity national origin", "federal state local", 'religion sex sexual', 
+                         'proud equal opportunity', 'religion sex national', 'sex national origin')) %>%
+  count(trigram) %>%
+  top_n(25) 
+
+plt_tri_hist <- ggplot(plt_tri, aes(x=fct_reorder(trigram,n),y=n)) + geom_bar(stat='identity', fill = "cornflowerblue") + 
+  coord_flip() + theme_bw()+
+  labs(title='Top 25 Trigrams',
+       subtitle = 'Stop Words Removed',
+       x='Word',
+       y= 'Count') + theme(legend.position="none")
+
+plt_tri_hist
+
+```
+
+The above plots are 25 most frequent unigrams, bigrams and trigrams. We can see that experience really speaks louder above everything. Universally companies are seeking demonstrated history of success. Following the list we see transferable soft skills like support, communication skills and management etc. 
+
+```{r message=FALSE}
+
+# Top unigrams separated by source (city)
+UnigramBySource <- resultTidy_Uni %>%
+  count(source,unigram) %>%
+  # filter non-informative words
+  filter(!unigram %in% non_info_words) 
+
+
+## for plotting (from https://github.com/dgrtwo/drlib/blob/master/R/reorder_within.R)
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+
+
+scale_x_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_x_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+
+
+UnigramBySource %>%
+  group_by(source) %>%
+  top_n(25) %>%
+  ggplot(aes(x=reorder_within(unigram,n,source),
+             y=n,
+             fill=source)) + 
+  geom_bar(stat='identity') + 
+  coord_flip() +
+  scale_x_reordered() +
+  facet_wrap(~source,scales = 'free',nrow=1) + 
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90,hjust=1)) +
+  theme(legend.position = "none")+
+  labs(title = 'Top Words by Location',
+       subtitle = 'Stop words removed',
+       x = 'Word',
+       y = 'Count')
+```
+
+Then we plotted the most frequent unigrams separately for each of the 4 regions. Generally the top unigrams in all cities resemble each other and only differ slightly in ranking. This can probably help answer our previous question on what contributes to the average salary difference. It's safe to rule out the possibility that business analysts in northern California are doing fancies jobs than their counterparts in sourther California. 
+
+### Regression on unigrams
+
+```{r message=FALSE}
+uni_list <- filter(resultTidy_Uni, !resultTidy_Uni$unigram %in% non_info_words) %>%
+  count(unigram) %>%
+  top_n(100) %>% 
+  pull(unigram)
+
+ca_filtered <- ca %>%
+  filter(!is.na(est_sal))
+
+
+# build data frame contain X and y variables. y is the estimated salary and X{x1, x2, ... x99} indicates whether the word exists in a job posting text. Here we used the existence of "experience" as baseline as it's the top frequent word. 
+# Each row represents a job posting, and columns represent top 100 unigrams plus 1 y predicted variable. 
+
+x = data.frame()
+for(word in uni_list[-27]){
+  for(i in 1:nrow(ca_filtered)){
+    sal = ca_filtered[[i, 'est_sal_num']]
+    x[i, 'est_sal'] = sal
+    description = ca_filtered[[i, 'text']]
+    #print(class(description))
+    if(grepl(word, description)){
+      x[i, word] = 1 #lengths(gregexpr(word, description))
+    } else {
+      x[i, word] = 0
+    }
+  }
+}
+
+
+lmMod <- lm(est_sal ~. , data=x)
+result <- tidy(lmMod)
+
+result %>%
+  filter(p.value <0.05) %>%
+  filter(term != '(Intercept)') %>%
+  arrange(estimate) %>%
+  ggplot(aes(x= reorder(term, -estimate), y=estimate, fill = estimate)) + geom_col() + 
+  theme(axis.text=element_text(size=12)) +
+  coord_flip() +
+  xlab('term') +
+  ylab('coefficient')
+
+```
+
+This is a relatively rough configuration of how words are associated with estimated salary. On the positive side, we see words like across, drive and best, indicating that candidates who are capable to drive changes and work across functions receive higher compensations. 
+
+### TF-IDF Analysis
+
+```{r}
+# get unigrams and their TF for TFIDF overall
+tidyJobs <- ca %>%
+  filter(!is.na(est_sal_num)) %>% 
+  select(text, jobid, est_sal_num) %>%
+  unnest_tokens(word, text) %>%
+  filter(!(word %in% c("__", "___"))) %>%
+  anti_join(stop_words) %>% 
+  count(word, jobid, est_sal_num)
+  
+
+tidyJobs$sal_range <- cut(tidyJobs$est_sal_num, breaks = c(30000, 70000, 90000, 110000,350000), 
+                          labels = c("low", "low-medium","medium-high", "high"))
+
+tidyJobsTFIDF <- tidyJobs %>%
+  bind_tf_idf(word,jobid,n) %>%
+  group_by(jobid) %>%
+  arrange(desc(tf_idf)) %>%
+  slice(1:10) %>% # get top 10 words in terms of tf-idf for each document
+  ungroup() %>%
+  mutate(xOrder=n():1) # for plotting
+
+# randomly pick 6 jobs for examination
+nJobPlot <- 6
+set.seed(7)
+plot.df <- filter(tidyJobsTFIDF, jobid %in% 
+                    sample(tidyJobs$jobid, nJobPlot, replace = FALSE))
+
+plot.df %>%
+  mutate(job_id_n = jobid) %>%
+  ggplot(aes(x=xOrder,y=tf_idf,fill=factor(job_id_n))) + 
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  facet_wrap(~ job_id_n,scales='free') +
+  scale_x_continuous(breaks = plot.df$xOrder,
+                     labels = plot.df$word,
+                     expand = c(0,0)) + 
+  coord_flip()+
+  labs(x='Word',
+       y='TF-IDF',
+       title = 'Top TF-IDF Words in Job Postings',
+       subtitle = paste0('Based on first ', 
+                         nJobPlot,
+                         ' Postings'))+
+  theme(axis.text.x=element_text(angle=90,hjust=1)) +
+  theme(legend.position = "none")
+
+
+```
+
+We randomly picked 6 jobs for TF-IDF visualizations. Each job is unique in TF-IDF representations and gives us a glimpse at the particular job requirements. Take Job 2022 for example, we can tell that the candidates are expected to know programming language Perl, probably in his role as consultant. Taking a look at the actual job title and hiring company, we know Dimensional Insight is hiring business intelligence consultant, which is pretty much what we can tell from TF-IDF representations. This might be a good method to analyze the particular technical skills required. 
+
+
+```{r}
+# Second, based on lower-paying (less than 1st quantile) and higher-paying (more than 3rd quantile) jobs
+
+# focus on below 1st Qu. paying jobs
+
+tidyJobsLowTFIDF <- tidyJobs %>%
+  filter(sal_range == "low") %>%
+  bind_tf_idf(word,jobid,n) %>%
+  group_by(jobid) %>%
+  arrange(desc(tf_idf)) %>%
+  slice(1:10) %>% # get top 10 words in terms of tf-idf
+  ungroup() %>%
+  mutate(xOrder=n():1) #%>%  # for plotting
+
+# plot
+nJobPlot <- 6
+plot.df <- filter(tidyJobsLowTFIDF, jobid %in% unique(tidyJobsLowTFIDF$jobid)[1:nJobPlot]) 
+
+
+plot.df %>%
+  mutate(job_id_n = (jobid)) %>%
+  ggplot(aes(x=xOrder,y=tf_idf,fill=factor(job_id_n))) + 
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  facet_wrap(~job_id_n, scales='free') +
+  scale_x_continuous(breaks = plot.df$xOrder,
+                     labels = plot.df$word,
+                     expand = c(0,0)) + 
+  coord_flip()+
+  labs(x='Word',
+       y='TF-IDF',
+       title = 'Top TF-IDF Words in Lower than 1st Quantile Paying Postings',
+       subtitle = paste0('Based on first ', 
+                         nJobPlot,
+                         ' Postings'))+theme(axis.text.x=element_text(angle=90,hjust=1)) +
+  theme(legend.position = "none")
+
+
+# focus on below 3rd Qu and above
+
+tidyJobsHighTFIDF <- tidyJobs %>%
+  filter(sal_range == "high") %>%
+  bind_tf_idf(word,jobid,n) %>%
+  group_by(jobid) %>%
+  arrange(desc(tf_idf)) %>%
+  slice(1:10) %>% # get top 10 words in terms of tf-idf
+  ungroup() %>%
+  mutate(xOrder=n():1) #%>%  # for plotting
+
+# plot
+nJobPlot <- 6
+plot.df <- tidyJobsHighTFIDF %>%
+  filter(jobid %in% unique(tidyJobsHighTFIDF$jobid)[1:nJobPlot]) 
+
+plot.df %>%
+  mutate(job_id_n = jobid) %>%
+  ggplot(aes(x=xOrder,y=tf_idf,fill=factor(job_id_n))) + 
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  facet_wrap(~ job_id_n,scales='free') +
+  scale_x_continuous(breaks = plot.df$xOrder,
+                     labels = plot.df$word,
+                     expand = c(0,0)) + 
+  coord_flip()+
+  labs(x='Word',
+       y='TF-IDF',
+       title = 'Top TF-IDF Words in Higher than 3rd Quantile Paying Postings',
+       subtitle = paste0('Based on first ', 
+                         nJobPlot,
+                         ' Postings'))+theme(axis.text.x=element_text(angle=90,hjust=1)) +
+  theme(legend.position = "none")
+
+```
+
+```{r message=FALSE}
+
+tidyJobsTFIDF %>% 
+  group_by(sal_range) %>% 
+  top_n(25) %>% 
+  ggplot(aes(x = reorder_within(word, tf_idf, sal_range),
+             y = tf_idf,
+             fill = sal_range)) + 
+  geom_bar(stat = "identity") + 
+  coord_flip() + 
+  scale_x_reordered() + 
+  facet_wrap(~sal_range,scales = 'free',nrow=1) + 
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90,hjust=1)) +
+  theme(legend.position = "none")+
+  labs(title = 'Top TF_IDF by Salary Range',
+       x = 'Word',
+       y = 'TF-IDF')
+
+```
+
+We plotted top 25 words with the highest average TF-IDFs for each of the 4 salary range. Here we can see that the salary differs more in ranks than in functions. To be more specific, we see words like managers, directors and CFO in high salary range.
+
+## Topic Models
+```{r message = FALSE}
+
+job_topic <- ca %>%
+  filter(text!= "NA") %>% 
+  select(jobid, text) %>% 
+  unnest_tokens(word, text) %>% 
+  anti_join(stop_words)
+
+wordCount <- job_topic %>%
+  count(word,sort = TRUE)
+commonWords <- c('business', 'data')
+
+job_topic_tidy <- job_topic %>%
+  filter(!word %in% commonWords) %>%
+  mutate(word = wordStem(word))
+
+wordCount <- job_topic_tidy %>%
+  count(word,sort = TRUE)
+
+# try to see the rare-word cutoff line
+# which(wordCount$n == 30)
+# set cutoff to 2000
+wordCut <- 2000
+vocab <- wordCount %>%
+  slice(1:wordCut)
+
+# installing development version of tidytext
+# devtools::install_github("juliasilge/tidytext")
+# library(tidytext)
+
+job_topic_length <- job_topic_tidy %>% 
+  count(jobid) %>% 
+  arrange(n)
+
+minLength <- 10
+job_topic_length <- job_topic_length %>%
+  filter(n >= minLength)
+
+job_topic_tidy <- job_topic_tidy %>%
+  filter(word %in% vocab$word)
+
+dtm <- job_topic_tidy %>% 
+  filter(jobid %in% job_topic_length$jobid) %>% 
+  count(jobid, word) %>% 
+  cast_dtm(jobid, word, n)
+
+# try number of topics and save 3 rds 
+# numTopics <- c(15, 20)
+
+# for (theNum in c(1:length(numTopics))){
+  # theLDA <- LDA(dtm, k = numTopics[theNum], method="Gibbs",
+                #control = list(alpha = 1/numTopics[theNum],iter=5000,burnin=1000,seed = 7))
+  
+  # saveRDS(theLDA,file=paste0('job_text',numTopics[theNum],'.rds'))
+# }
+
+### check for 20 models
+job_text20 <- readRDS("~/git/glassdoor/job_text20.rds")
+
+theTopicsBeta20 <- tidy(job_text20, matrix = "beta")
+
+TopicsTop20 <- theTopicsBeta20 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  ungroup() %>%
+  mutate(x = n():1)  # for plotting
+
+plTopicWeights20 <- TopicsTop20 %>%
+  mutate(topic=factor(topic)) %>%
+  ggplot(aes(x=x,y=beta,fill=topic)) + 
+  geom_bar(stat='identity',show.legend = F) + 
+  coord_flip() + 
+  facet_wrap(~topic,scales='free') +
+  scale_x_continuous(breaks = TopicsTop20$x,
+                     labels = TopicsTop20$term,
+                     expand = c(0,0)) + 
+  labs(title='Top Words by Topic',
+       subtitle = paste0(20,' Topic LDA of ',
+                         prettyNum(nrow(job_topic_length),big.mark=",",scientific=FALSE), " Glassdoor Job Postings"),
+       x = 'word',
+       y = 'beta')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size=6),
+        axis.text.y = element_text(size = 5))
+
+plTopicWeights20
+
+
+
+##check for 15 topics
+job_text15 <- readRDS("~/git/glassdoor/job_text15.rds")
+
+theTopicsBeta15 <- tidy(job_text15, matrix = "beta")
+
+TopicsTop15 <- theTopicsBeta15 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta) %>%
+  ungroup() %>%
+  mutate(x = n():1)  # for plotting
+
+plTopicWeights15 <- TopicsTop15 %>%
+  mutate(topic=factor(topic)) %>%
+  ggplot(aes(x=x,y=beta,fill=topic)) + 
+  geom_bar(stat='identity',show.legend = F) + 
+  coord_flip() + 
+  facet_wrap(~topic,scales='free') +
+  scale_x_continuous(breaks = TopicsTop15$x,
+                     labels = TopicsTop15$term,
+                     expand = c(0,0)) + 
+  labs(title='Top Words by Topic',
+       subtitle = paste0(15,' Topic LDA of ',
+                         prettyNum(nrow(job_topic_length),big.mark=",",scientific=FALSE), " Glassdoor Job Postings"),
+       x = 'word',
+       y = 'beta')+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size=6),
+        axis.text.y = element_text(size = 5))
+
+plTopicWeights15
+
+```
+
+Here we ran topic models on the job posting texts and picked 15 models and 20 models. Some topics are pretty clear, like banking, financial accounting, digital marketing and employee benefits. Some are not so decisive and mingled with words related to transferable soft skills. 
+
+```{r message=FALSE, warning = FALSE}
+### visualize 20 topics in html
+
+theTopicsBetaW <- reshape2::dcast(tidy(job_text20, matrix = "beta"), topic~term, value.var = "beta")
+theTopicsBetaW$topic <- NULL
+theTopicsGammaW <- select(spread(tidy(job_text20, matrix = "gamma"),topic,gamma),-document)
+theTerms <- colnames(theTopicsBetaW)
+
+theVocab <- vocab %>%
+  mutate(word = factor(word,levels=theTerms)) %>%
+  arrange(word) %>%
+  mutate(word=as.character(word))
+
+json <- createJSON(
+  phi = theTopicsBetaW, 
+  theta = theTopicsGammaW, 
+  doc.length = job_topic_length$n, 
+  vocab = theTerms, 
+  R = 20,
+  term.frequency = theVocab$n
+)
+
+serVis(json)
+
+```
+
+Here we visualized 20 topics interactively. This gives a more clear picture of what the 20 topics are about and how they resemble with each other. 
+
+
