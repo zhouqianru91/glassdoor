@@ -45,16 +45,16 @@ Previous to this part of the analysis, we scraped job posting data from Glassdoo
 # import data files, merge and remove duplicates
 
 # if city is missing, filling in with the broad region name, i.e, la, sf or mountain view
-la <- read_csv("output_LA.csv")
+la <- read_csv("data/output_LA.csv")
 la$source <- "Los Angeles"
 
-mountview <- read_csv("MTV_withRating_All.csv")
+mountview <- read_csv("data/MTV_withRating_All.csv")
 mountview$source <- "Mountain View"
 
-sf <- read_csv("SF_withRating_All.csv")
+sf <- read_csv("data/SF_withRating_All.csv")
 sf$source <- "San Francisco"
 
-sd <- read_csv("San Diego.csv")
+sd <- read_csv("data/San Diego.csv")
 sd$source <- "San Diego"
 colnames(sd) <- sub("company rating", "com_rating", names(sd))
 
@@ -203,7 +203,9 @@ title50freq <- title %>%
   count(word) %>% 
   anti_join(stop_words) %>% 
   top_n(50) 
+
 wordcloud(title50freq$word, title50freq$n, scale = c(5,0.5), colors = brewer.pal(8, "Set1"))
+wordcloud(title$word,  scale = c(5,0.5), max.word = 50, colors = brewer.pal(8, "Set1"))
 
 ```
 
@@ -620,7 +622,7 @@ dtm <- job_topic_tidy %>%
 # }
 
 ### check for 20 models
-job_text20 <- readRDS("~/git/glassdoor/job_text20.rds")
+job_text20 <- readRDS("job_text20.rds")
 
 theTopicsBeta20 <- tidy(job_text20, matrix = "beta")
 
@@ -654,7 +656,7 @@ plTopicWeights20
 
 
 ##check for 15 topics
-job_text15 <- readRDS("~/git/glassdoor/job_text15.rds")
+job_text15 <- readRDS("job_text15.rds")
 
 theTopicsBeta15 <- tidy(job_text15, matrix = "beta")
 
